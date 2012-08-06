@@ -46,7 +46,6 @@
 #define IF_OPER_UP 6
 #endif
 
-
 struct wpa_driver_nl80211_data {
 	void *ctx;
 	int wext_event_sock;
@@ -2727,6 +2726,220 @@ nla_put_failure:
 
 #endif /* CONFIG_CLIENT_MLME */
 
+#ifdef ANDROID
+int linux_set_iface_flags(int sock, const char *ifname, int dev_up)
+{
+	struct ifreq ifr;
+
+	if (sock < 0)
+		return -1;
+
+	os_memset(&ifr, 0, sizeof(ifr));
+	os_strlcpy(ifr.ifr_name, ifname, IFNAMSIZ);
+
+	if (ioctl(sock, SIOCGIFFLAGS, &ifr) != 0) {
+		wpa_printf(MSG_ERROR, "Could not read interface %s flags: %s",
+			   ifname, strerror(errno));
+		return -1;
+	}
+
+	if (dev_up) {
+		if (ifr.ifr_flags & IFF_UP)
+			return 0;
+		ifr.ifr_flags |= IFF_UP;
+	} else {
+		if (!(ifr.ifr_flags & IFF_UP))
+			return 0;
+		ifr.ifr_flags &= ~IFF_UP;
+	}
+
+	if (ioctl(sock, SIOCSIFFLAGS, &ifr) != 0) {
+		wpa_printf(MSG_ERROR, "Could not set interface %s flags: %s",
+			   ifname, strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+
+int linux_get_ifhwaddr(int sock, const char *ifname, u8 *addr)
+{
+	struct ifreq ifr;
+
+	os_memset(&ifr, 0, sizeof(ifr));
+	os_strlcpy(ifr.ifr_name, ifname, IFNAMSIZ);
+	if (ioctl(sock, SIOCGIFHWADDR, &ifr)) {
+		wpa_printf(MSG_ERROR, "Could not get interface %s hwaddr: %s",
+			   ifname, strerror(errno));
+		return -1;
+	}
+
+	if (ifr.ifr_hwaddr.sa_family != ARPHRD_ETHER) {
+		wpa_printf(MSG_ERROR, "%s: Invalid HW-addr family 0x%04x",
+			   ifname, ifr.ifr_hwaddr.sa_family);
+		return -1;
+	}
+	os_memcpy(addr, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+
+	return 0;
+}
+
+
+int linux_set_ifhwaddr(int sock, const char *ifname, const u8 *addr)
+{
+	struct ifreq ifr;
+
+	os_memset(&ifr, 0, sizeof(ifr));
+	os_strlcpy(ifr.ifr_name, ifname, IFNAMSIZ);
+	os_memcpy(ifr.ifr_hwaddr.sa_data, addr, ETH_ALEN);
+	ifr.ifr_hwaddr.sa_family = ARPHRD_ETHER;
+
+	if (ioctl(sock, SIOCSIFHWADDR, &ifr)) {
+		wpa_printf(MSG_DEBUG, "Could not set interface %s hwaddr: %s",
+			   ifname, strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+#define WPA_EVENT_DRIVER_STATE          "CTRL-EVENT-DRIVER-STATE "
+
+#define DRV_NUMBER_SEQUENTIAL_ERRORS     4
+
+#define WPA_PS_ENABLED   0
+#define WPA_PS_DISABLED  1
+
+#define BLUETOOTH_COEXISTENCE_MODE_ENABLED   0
+#define BLUETOOTH_COEXISTENCE_MODE_DISABLED  1
+#define BLUETOOTH_COEXISTENCE_MODE_SENSE     2
+
+
+static int g_drv_errors = 0;
+static int g_power_mode = 0;
+
+int send_and_recv_msgs(struct wpa_driver_nl80211_data *drv, struct nl_msg *msg,
+                       int (*valid_handler)(struct nl_msg *, void *),
+                       void *valid_data);
+
+static void wpa_driver_send_hang_msg(struct wpa_driver_nl80211_data *drv)
+{
+	g_drv_errors++;
+	if (g_drv_errors > DRV_NUMBER_SEQUENTIAL_ERRORS) {
+		g_drv_errors = 0;
+		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "HANGED");
+	}
+}
+
+/**
+ * struct wpa_signal_info - Information about channel signal quality
+ */
+struct wpa_signal_info {
+	u32 frequency;
+	int above_threshold;
+	int current_signal;
+	int current_noise;
+	int current_txrate;
+};
+
+static int get_link_signal(struct nl_msg *msg, void *arg)
+{
+	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *sinfo[NL80211_STA_INFO_MAX + 1];
+	static struct nla_policy policy[NL80211_STA_INFO_MAX + 1] = {
+		[NL80211_STA_INFO_SIGNAL] = { .type = NLA_U8 },
+	};
+	struct nlattr *rinfo[NL80211_RATE_INFO_MAX + 1];
+	static struct nla_policy rate_policy[NL80211_RATE_INFO_MAX + 1] = {
+		[NL80211_RATE_INFO_BITRATE] = { .type = NLA_U16 },
+		[NL80211_RATE_INFO_MCS] = { .type = NLA_U8 },
+		[NL80211_RATE_INFO_40_MHZ_WIDTH] = { .type = NLA_FLAG },
+		[NL80211_RATE_INFO_SHORT_GI] = { .type = NLA_FLAG },
+	};
+	struct wpa_signal_info *sig_change = arg;
+
+	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+		  genlmsg_attrlen(gnlh, 0), NULL);
+	if (!tb[NL80211_ATTR_STA_INFO] ||
+	    nla_parse_nested(sinfo, NL80211_STA_INFO_MAX,
+			     tb[NL80211_ATTR_STA_INFO], policy))
+		return NL_SKIP;
+	if (!sinfo[NL80211_STA_INFO_SIGNAL])
+		return NL_SKIP;
+
+	sig_change->current_signal =
+		(s8) nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]);
+
+	if (sinfo[NL80211_STA_INFO_TX_BITRATE]) {
+		if (nla_parse_nested(rinfo, NL80211_RATE_INFO_MAX,
+				     sinfo[NL80211_STA_INFO_TX_BITRATE],
+				     rate_policy)) {
+			sig_change->current_txrate = 0;
+		} else {
+			if (rinfo[NL80211_RATE_INFO_BITRATE]) {
+				sig_change->current_txrate =
+					nla_get_u16(rinfo[
+					     NL80211_RATE_INFO_BITRATE]) * 100;
+			}
+		}
+	}
+
+	return NL_SKIP;
+}
+
+int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
+				  size_t buf_len )
+{
+	struct wpa_driver_nl80211_data *drv = priv;
+	struct ifreq ifr;
+	int ret = 0;
+
+	if (os_strcasecmp(cmd, "STOP") == 0) {
+		linux_set_iface_flags(drv->ioctl_sock, drv->ifname, 0);
+		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "STOPPED");
+	} else if (os_strcasecmp(cmd, "START") == 0) {
+		linux_set_iface_flags(drv->ioctl_sock, drv->ifname, 1);
+		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "STARTED");
+	} else if (os_strcasecmp(cmd, "RELOAD") == 0) {
+		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "HANGED");
+	} else if (os_strncasecmp(cmd, "POWERMODE ", 10) == 0) {
+		wpa_printf(MSG_DEBUG, "set powermode\n");
+		ret = 0;
+	} else if (os_strncasecmp(cmd, "GETPOWER", 8) == 0) {
+		ret = os_snprintf(buf, buf_len, "POWERMODE = %d\n", g_power_mode);
+	} else if (os_strncasecmp(cmd, "BTCOEXMODE ", 11) == 0) {
+		int mode = atoi(cmd + 11);
+		if (mode == BLUETOOTH_COEXISTENCE_MODE_DISABLED) { /* disable BT-coex */
+			wpa_printf(MSG_DEBUG, "disable BT-coex\n");
+			ret = 0;
+		} else if (mode == BLUETOOTH_COEXISTENCE_MODE_SENSE) { /* enable BT-coex */
+			wpa_printf(MSG_DEBUG, "disable BT-coex\n");
+			ret = 0;
+		} else {
+			wpa_printf(MSG_DEBUG, "invalid btcoex mode: %d", mode);
+			ret = -1;
+		}
+	} else if ((os_strcasecmp(cmd, "RSSI") == 0) || (os_strcasecmp(cmd, "RSSI-APPROX") == 0)) {
+		wpa_printf(MSG_DEBUG, "Get RSSI or APPROX");
+		ret = 0;
+	} else if (os_strcasecmp(cmd, "LINKSPEED") == 0) {
+		wpa_printf(MSG_DEBUG, "Get LINKSPEED");
+		ret = 0;
+	} else if (os_strcasecmp(cmd, "MACADDR") == 0) {
+		u8 macaddr[ETH_ALEN] = {};
+
+		ret = linux_get_ifhwaddr(drv->ioctl_sock, drv->ifname, macaddr);
+		if (!ret)
+			ret = os_snprintf(buf, buf_len,
+					  "Macaddr = " MACSTR "\n", MAC2STR(macaddr));
+	} else {
+		wpa_printf(MSG_INFO, "%s: Unsupported command %s", __func__, cmd);
+	}
+	return ret;
+}
+#endif
 
 const struct wpa_driver_ops wpa_driver_nl80211_ops = {
 	.name = "nl80211",
@@ -2763,4 +2976,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
 	.mlme_add_sta = wpa_driver_nl80211_mlme_add_sta,
 	.mlme_remove_sta = wpa_driver_nl80211_mlme_remove_sta,
 #endif /* CONFIG_CLIENT_MLME */
+#ifdef ANDROID
+	.driver_cmd = wpa_driver_nl80211_driver_cmd,
+#endif
 };
