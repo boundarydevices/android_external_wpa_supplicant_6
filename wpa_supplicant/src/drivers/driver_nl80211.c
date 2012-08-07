@@ -69,6 +69,11 @@ struct wpa_driver_nl80211_data {
 
 	char mlmedev[IFNAMSIZ + 1];
 
+	u8 bssid[ETH_ALEN];
+	u8 ssid[32];
+	int associated;
+	size_t ssid_len;
+
 	int scan_complete_events;
 
 	struct nl_handle *nl_handle;
@@ -321,8 +326,8 @@ static int wpa_driver_nl80211_set_bssid(void *priv, const u8 *bssid)
 	struct wpa_driver_nl80211_data *drv = priv;
 	struct iwreq iwr;
 	int ret = 0;
-
 	os_memset(&iwr, 0, sizeof(iwr));
+	os_memcpy(drv->bssid,bssid,sizeof(drv->bssid));
 	os_strlcpy(iwr.ifr_name, drv->ifname, IFNAMSIZ);
 	iwr.u.ap_addr.sa_family = ARPHRD_ETHER;
 	if (bssid)
@@ -387,6 +392,9 @@ static int wpa_driver_nl80211_set_ssid(void *priv, const u8 *ssid,
 	iwr.u.essid.flags = (ssid_len != 0);
 	os_memset(buf, 0, sizeof(buf));
 	os_memcpy(buf, ssid, ssid_len);
+	os_memcpy(drv->ssid,ssid,ssid_len);
+	drv->ssid_len = ssid_len;
+
 	iwr.u.essid.pointer = (caddr_t) buf;
 	if (drv->we_version_compiled < 21) {
 		/* For historic reasons, set SSID length to include one extra
@@ -2026,6 +2034,7 @@ static int wpa_driver_nl80211_disassociate(void *priv, const u8 *addr,
 {
 	struct wpa_driver_nl80211_data *drv = priv;
 	wpa_printf(MSG_DEBUG, "%s", __FUNCTION__);
+        drv->associated = 0;
 	return wpa_driver_nl80211_mlme(drv, addr, IW_MLME_DISASSOC,
 				    reason_code);
 }
@@ -2206,6 +2215,8 @@ static int wpa_driver_nl80211_associate(
 	if (params->bssid &&
 	    wpa_driver_nl80211_set_bssid(drv, params->bssid) < 0)
 		ret = -1;
+
+        drv->associated = (0 == ret);
 
 	return ret;
 }
@@ -2889,12 +2900,41 @@ static int get_link_signal(struct nl_msg *msg, void *arg)
 	return NL_SKIP;
 }
 
+static int wpa_driver_get_link_signal(struct wpa_driver_nl80211_data *drv, struct wpa_signal_info *sig)
+{
+	struct nl_msg *msg;
+	int ret = -1;
+
+	sig->current_signal = -9999;
+	sig->current_txrate = 0;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return -1;
+
+	genlmsg_put(msg, 0, 0, genl_family_get_id(drv->nl80211), 0,
+		    0, NL80211_CMD_GET_STATION, 0);
+
+	NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, drv->ifindex);
+	NLA_PUT(msg, NL80211_ATTR_MAC, ETH_ALEN, drv->bssid);
+
+	ret = send_and_recv_msgs(drv, msg, get_link_signal, sig);
+	msg = NULL;
+	if (ret < 0)
+		wpa_printf(MSG_ERROR, "nl80211: get link signal fail: %d", ret);
+nla_put_failure:
+	nlmsg_free(msg);
+	return ret;
+}
+
 int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 				  size_t buf_len )
 {
 	struct wpa_driver_nl80211_data *drv = priv;
 	struct ifreq ifr;
 	int ret = 0;
+
+	wpa_msg(drv->ctx, MSG_DEBUG, "%s: command %s\n", __func__, cmd);
 
 	if (os_strcasecmp(cmd, "STOP") == 0) {
 		linux_set_iface_flags(drv->ioctl_sock, drv->ifname, 0);
@@ -2922,11 +2962,38 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
 			ret = -1;
 		}
 	} else if ((os_strcasecmp(cmd, "RSSI") == 0) || (os_strcasecmp(cmd, "RSSI-APPROX") == 0)) {
-		wpa_printf(MSG_DEBUG, "Get RSSI or APPROX");
-		ret = 0;
+		struct wpa_signal_info sig;
+		int rssi;
+
+		if (!drv->associated) {
+			wpa_printf(MSG_DEBUG, "%s: no rssi until associated\n", __func__);
+			return -1;
+		}
+
+		ret = wpa_driver_get_link_signal(drv, &sig);
+		if (ret < 0) {
+			wpa_printf(MSG_DEBUG, "%s: error %d from get_link_signal\n", __func__, ret);
+			wpa_driver_send_hang_msg(drv);
+		} else {
+			rssi = sig.current_signal;
+			wpa_printf(MSG_DEBUG, "%s: rssi %d\n", __func__, rssi);
+			ret = os_snprintf(buf, buf_len, "%s rssi %d\n", __func__, rssi);
+		}
 	} else if (os_strcasecmp(cmd, "LINKSPEED") == 0) {
-		wpa_printf(MSG_DEBUG, "Get LINKSPEED");
-		ret = 0;
+		struct wpa_signal_info sig;
+		int linkspeed;
+
+		if (!drv->associated)
+			return -1;
+
+		ret = wpa_driver_get_link_signal(priv, &sig);
+		if (ret < 0) {
+			wpa_driver_send_hang_msg(drv);
+		} else {
+			linkspeed = sig.current_txrate / 1000;
+			wpa_printf(MSG_DEBUG, "LinkSpeed %d\n", linkspeed);
+			ret = os_snprintf(buf, buf_len, "LinkSpeed %d\n", linkspeed);
+		}
 	} else if (os_strcasecmp(cmd, "MACADDR") == 0) {
 		u8 macaddr[ETH_ALEN] = {};
 
